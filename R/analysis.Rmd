@@ -1,0 +1,1248 @@
+---
+title: "Infection profiles in a wild rat–protozoan network are shaped by host traits and environmental factors"
+subtitle: "Main analysis"
+date: "Last edit: 2025-08-05"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    collapse: false
+    number_sections: true
+    code_folding: hide
+    highlight: tango
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(results = "asis", message=FALSE, warning=FALSE, cache=TRUE, eval = TRUE, dev = c('png','pdf'), out.width = '100%', out.height='60%')
+```
+
+```{r load libraries and set parameters}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+library(igraph)
+library(magrittr)
+library(ggpubr)
+library(xgboost)
+library(ape)
+library(pROC)
+library(PRROC)
+library(caret)
+
+rm(list=ls())
+
+
+# colors for infection profiles
+colors <- c("#004c6d", "#6996b3", "#c1e7ff","#662506", "#993404", "#cc4c02", "#fe9929", "#fec44f", "#ffeda0", "#ffffe5")
+
+
+# predefined theme set
+axis_text_size <- 10
+title_text_size <- 12
+my_theme <- theme_bw() +  
+  theme(axis.text=element_text(size=axis_text_size,color = "black"), # axis text size and color
+        axis.title=element_text(size=title_text_size,face="bold"), # axis title size
+        legend.text = element_text(size = axis_text_size), # legend text size
+        legend.title = element_text(size = title_text_size), # legend title size
+        panel.grid = element_blank(), # remove grid
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1) # border around the plot
+        )
+```
+
+# SBM analysis
+
+```{r creating matrix, include=FALSE}
+# load the host-protozoa data
+G4_long_otu <- read_csv("../data/data_processed/G4_long_otu.csv") 
+
+# metadata
+metadata <- read_csv("../data/data_processed/rat_metadata.csv") 
+
+# taking only hosts we have protozoa and metadata information
+hosts <- intersect(G4_long_otu$host_ID, metadata$host_ID)
+G4_long_otu <- G4_long_otu %>% 
+  filter(host_ID %in% hosts)
+
+## un-infected hosts are excluded from this analysis and are pre-defined as a distinct group
+
+# hosts with no infection
+group_zero <- G4_long_otu %>% 
+  group_by(host_ID) %>% 
+  summarise(n = sum(link)) %>%
+  filter(n==0) %>% 
+  mutate(host_group = 1) %>% 
+  select(-n)
+
+# transforming to matrix
+# only infected hosts
+pmat <- G4_long_otu %>% 
+  select(host_ID, otu_ID, link) %>%
+  filter(!(host_ID %in% group_zero$host_ID)) %>%
+  spread(otu_ID, link, fill = 0) %>% 
+  column_to_rownames("host_ID") %>% 
+  as.matrix()
+
+```
+
+```{r Running host-protozoa SBM, include=FALSE}
+# Latent Block Model
+set.seed(123)
+sbm_fit <- blockmodels::BM_bernoulli(pmat, membership_type = "LBM")
+sbm_fit$plotting <- '' # Set plots of the convergence process to off
+sbm_fit$estimate()
+
+# saving the SBM results
+save(sbm_fit,file="../data/data_results/sbm_fit.RData")
+
+# Select the best number of clusters (based on maximum likelihood)
+best_run <- which.max(sbm_fit$ICL)
+
+# Extract the community memberships
+community_assignments <- sbm_fit$memberships[[best_run]]
+community_assignments$plot()
+```
+
+```{r extracting group membership and creating dataset for the model, include=FALSE}
+# host sbm-membership
+memb_host <- as.data.frame(sbm_fit$memberships[[best_run]]$Z1) %>%
+  mutate(host_group = max.col(.,'first')+1) %>% 
+  mutate(host_ID = as.double(rownames(pmat))) %>% # attaching hosts IDs
+  dplyr::select(host_ID,host_group) %>% 
+  bind_rows(group_zero)  # adding the uninfected group
+
+# protozoa sbm-membership
+memb_otu <- as.data.frame(sbm_fit$memberships[[best_run]]$Z2) %>%
+  mutate(otu_group = max.col(.,'first')) %>% 
+  mutate(otu_ID = as.numeric(colnames(pmat))) %>%
+  select(otu_group,otu_ID)
+```
+
+## SBM figure
+
+```{r}
+axis_text_size <- 8
+title_text_size <- 10
+
+# combining the dataframes
+lon <- G4_long_otu %>%
+  left_join(memb_host, by = "host_ID") %>%
+  left_join(memb_otu, by = "otu_ID") %>%
+  mutate(host_group = as.factor(host_group),
+         otu_group = as.factor(otu_group))
+
+# average host degree
+host_degree <- lon %>% 
+  group_by(host_group, host_ID) %>% 
+  summarise(n = sum(link)) %>% 
+  group_by(host_group) %>% 
+  summarise(maximum = max(n), minimum = min(n), average = mean(n))
+
+# average OTU degree
+otu_degree <- lon %>% 
+  group_by(otu_group, otu_ID) %>% 
+  summarise(n = sum(link)) %>% 
+  group_by(otu_group) %>% 
+  summarise(maximum = max(n), minimum = min(n), average = mean(n)/841*100)
+```
+
+```{r pi matrix}
+lon_links <- lon %>%
+  dplyr::filter(link == 1)
+
+# calculating number of links between host and protozoa profiles
+link_table <- table(lon_links$host_group, lon_links$otu_group)
+
+# Convert the table into a data frame
+link_df <- as.data.frame(as.table(link_table)) %>%
+  mutate(host_group = as.numeric(Var1)) %>%
+  mutate(otu_group = as.numeric(Var2)) %>%
+  select(-Var1,-Var2)
+
+# adding pi from the model (the probability of a link between the groups in the network)
+# adding the uninfected group with 0s
+p <- as.data.frame(sbm_fit$model_parameters[[best_run]]$pi) %>% 
+  rownames_to_column("host_group") %>% 
+  mutate(host_group = as.numeric(host_group)+1) %>%
+  gather("otu_group", "pi", starts_with("V")) %>% 
+  mutate(otu_group = as.numeric(gsub(".*?([0-9]+).*", "\\1", otu_group))) %>%
+  right_join(link_df, by = c("host_group","otu_group")) %>%
+  mutate(pi = ifelse(is.na(pi),0,pi)) %>% 
+  mutate(host_group = as.factor(host_group)) %>%
+  mutate(otu_group = as.factor(otu_group))
+
+# number of host individuals in every host profile
+count_host <- memb_host %>%
+  group_by(host_group) %>%
+  count() %>%
+  mutate(host_group = as.character(host_group)) %>%
+  mutate(host_group_count = paste(host_group," (n = ",n,")",sep = "")) %>%
+  select(host_group_count,host_group)
+
+# number of OTUs in every protozoa profile
+count_otu <- memb_otu %>%
+  group_by(otu_group) %>%
+  count() %>%
+  mutate(otu_group = as.character(otu_group)) %>%
+  mutate(otu_group_count = paste(otu_group," (n = ",n,")",sep = "")) %>%
+  select(otu_group_count,otu_group)
+
+# plotting
+#pdf('../../results/figures/fig_sbm_pi.pdf')
+ pi_plot <- p %>%
+  left_join(count_host, by = "host_group") %>%
+  left_join(count_otu, by = "otu_group") %>%
+  mutate(
+    Label = paste0(round(pi, 3), "\n(", Freq, ")")) %>%
+  ggplot(aes(x = host_group_count,
+             y = otu_group_count,
+             fill = pi,
+             label = Label)) +
+  geom_tile() +
+  geom_text(color = "black", size = 3) +  
+  scale_fill_gradient(low = "#efedf5", high = "#807dba") + 
+  theme_classic() +
+  theme(
+    axis.title = element_text(size = title_text_size, color = "black", face = "bold"),
+    axis.text = element_text(size = axis_text_size, color = 'black'),
+    title = element_text(size = title_text_size),
+    legend.text = element_text(size = axis_text_size),
+    legend.title = element_text(size = title_text_size),
+    legend.position = "top"
+  ) +
+  labs(x = "Host infection profile", y = "Protozoa infection profile", fill = "Link probability") +
+  coord_fixed(ratio = 0.5)
+#dev.off()
+pi_plot
+
+```
+
+```{r, groups degree}
+## plotting OTU degree
+gg1 <- lon %>%
+  filter(link==1) %>%
+  group_by(otu_ID,otu_group) %>%
+  summarise(prevalence = n_distinct(host_ID)) %>%
+  ggplot(aes(x = prevalence, color = otu_group, fill = otu_group)) +
+  geom_histogram(binwidth = 15, color = "black") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)) + 
+  theme(axis.title = element_text(size=title_text_size, color = "black", face = "bold"),
+        axis.text = element_text(size=axis_text_size, color = "black"),
+        legend.text = element_text(size = axis_text_size), 
+        legend.title = element_text(size = title_text_size),
+        plot.title = element_text(hjust = 0.5, size = title_text_size, face = "bold")) +
+  labs(title = "Protozoa level", x = "OTU degree", y = "No. of OTUs", fill = "Profile") +
+  theme(legend.position = "right") +
+  theme(aspect.ratio=1)+ 
+  guides(fill = guide_legend(override.aes = list(size = 0.5))) +
+  scale_fill_manual(values = colors[4:10])
+
+
+
+## plotting host degree
+
+lon_richness <- lon %>% 
+  group_by(host_ID, host_group) %>% 
+  summarise(richness = sum(link))
+
+gg2 <- lon_richness %>%
+  ggplot(aes(x = richness, fill = host_group)) +
+  geom_histogram(binwidth = 1, color = "black") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = title_text_size, face = "bold"),
+    axis.text = element_text(size = axis_text_size, color = "black"),
+    axis.title = element_text(size = title_text_size, face = "bold"),
+    legend.text = element_text(size = axis_text_size), 
+    legend.title = element_text(size = title_text_size),
+    panel.grid = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1)  # Keep the border
+  ) +
+  scale_x_continuous(breaks = seq(0, 10, by = 2))+
+  labs(title = "Host level", x = "Host degree", y = "No. of hosts", fill = "Profile") +
+  theme(legend.position = "right") + 
+  theme(aspect.ratio = 1) +
+  guides(fill = guide_legend(override.aes = list(size = 0.5))) +
+  scale_fill_manual(values = colors[1:3])
+
+```
+
+```{r}
+# combining the plots
+fig_sbm <- ggarrange(gg2, gg1, ncol = 2, labels = c("B", "C"))
+
+fig_sbm
+```
+
+## Network figure
+
+```{r}
+# creating an edgelist
+edges <- G4_long_otu %>%
+  filter(link == 1) %>%
+  select(host_ID, otu_ID) %>% 
+  mutate(host_ID=as.factor(host_ID), otu_ID=as.factor(otu_ID))
+
+# Ensure all nodes (even those without connections) are included
+all_hosts <- unique(G4_long_otu$host_ID)
+all_parasites <- unique(G4_long_otu$otu_ID)
+
+memb_host2 <- memb_host %>% mutate(group = paste("H",host_group,sep="")) %>% rename("name"=host_ID)
+memb_otu2 <- memb_otu %>% mutate(group = paste("O",otu_group,sep="")) %>% rename("name"=otu_ID)
+
+# Create a dataframe with all nodes
+
+# colors by profile
+colors_table <- tibble(group = c("H1","H2","H3","O1","O2","O3","O4","O5","O6","O7"),
+                       color = colors)
+
+all_nodes <- data_frame(name = c(memb_host2$name, memb_otu2$name),
+                    group = c(memb_host2$group, memb_otu2$group)) %>% 
+  left_join(colors_table, by="group") %>% 
+  mutate(name=as.factor(name)) %>% 
+  arrange(group)
+
+# Create a graph object
+g <- graph_from_data_frame(d = edges, vertices = all_nodes, directed = FALSE)
+
+# Parameters 
+node_size <- 4        # Node size
+edge_width <- 0.7     # Edge width
+frame_width <- 1    # Node frame (border) width
+
+# plotting
+#pdf('../results/figures/figure_network.pdf')
+set.seed(123)
+par(mar = c(0, 0, 0, 0))
+plot(g, layout = layout_with_fr(g),
+     vertex.size = node_size, vertex.label = NA,
+     vertex.color = V(g)$color, vertex.frame.color = "black", vertex.frame.width = frame_width,
+     edge.color = "gray50", edge.width = edge_width) 
+legend("topright", legend = unique(all_nodes$group), col = unique(all_nodes$color), pch = 16, pt.cex = 1.2, bty = "n", title = "Profiles")
+#dev.off()
+```
+
+
+# Protozoa taxonomy
+
+```{r}
+# reading taxonomy data
+G4_taxonomy <- read_csv("../data/data_processed/G4_taxonomy.csv") 
+
+```
+
+## OTUs taxonomy and distribution
+
+```{r}
+# OTUs prevalence
+otu_prevalence <- G4_long_otu %>% 
+  filter(link==1) %>% 
+  count(otu_ID, final_id) %>% 
+  mutate(prevalence = n/841) %>% 
+  arrange(desc(n)) %>% 
+  rownames_to_column("OTU_Number") 
+
+# Ensure OTU_Number is treated as a factor to maintain order
+otu_prevalence$OTU_Number <- factor(otu_prevalence$OTU_Number, levels = otu_prevalence$OTU_Number)
+
+color_palette <- c("#E69F00", "#56B4E9", "#A65628", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#8bdc83", "#F781BF", "#009E73")
+
+
+# plotting distribution
+#pdf('../results/figures/otu_distribution.pdf')
+otu_prevalence %>% 
+  ggplot(aes(x = OTU_Number, y = prevalence, fill = final_id)) +
+  geom_bar(stat = "identity") +  
+  labs(x = "OTU number", y = "Prevalence", fill = "Taxonomy") +
+  scale_fill_manual(values = color_palette) +
+  theme_bw() + 
+  theme(legend.title = element_text(face = "bold"), panel.grid = element_blank(),axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title = element_text(size = 14)) 
+#dev.off()
+```
+
+## Host profiles taxonomy
+
+```{r}
+# plotting OTU taxonomy per host profile as pie chart
+
+otu_pie <- G4_taxonomy %>%
+  select(otu_ID, final_id) %>% 
+  inner_join(memb_otu, by = "otu_ID") %>%
+  select(otu_ID,otu_group,final_id) %>%
+  unique() %>%
+  drop_na(otu_group) %>%
+  mutate(otu_group = factor(otu_group)) %>%
+  group_by(otu_group, final_id) %>%
+  summarise(count = n(), .groups = "drop") %>% 
+  group_by(otu_group) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+#pdf('../../results/figures/otu_pie.pdf')
+otu_pie %>% 
+  ggplot( aes(x = "", y = percentage, fill = final_id)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  facet_wrap(~ otu_group) +
+  theme(legend.text = element_text(size = 10), 
+        legend.title = element_text(size = title_text_size-2),
+        aspect.ratio = 1) +
+  theme_void() +
+  scale_fill_manual(values = color_palette)+
+  labs(fill = "Taxonomy")
+#dev.off()
+```
+
+
+# Predicting host profiles
+
+```{r}
+# Load data and choose features for the model
+sbm_model <- memb_host %>%  
+  left_join(metadata, by="host_ID")
+
+data <- sbm_model %>%
+  dplyr::select(host_group,
+                mass, 
+                sex, 
+                age_repro,
+                BCI_residual,
+                dist_village,
+                avg_rattus,
+                avg_native, 
+                avg_non_native,
+                veg_season_pc1, 
+                veg_season_pc2,
+                nc_inf,
+               Lachnospiraceae,Lactobacillaceae,Muribaculaceae,Prevotellaceae
+                ) %>% 
+  mutate(sex = ifelse(sex=="male",1,0)) %>%  # sex is turn into 1 (male) or 0 (female)
+mutate(host_group = as.factor(host_group))
+
+head(data)
+
+```
+
+This script performs a nested cross-validation procedure to train an XGBoost model, tune hyperparameters, and evaluate performance using ROC and PR curves.
+
+```{r, include=FALSE}
+
+# Set Random Seed for Reproducibility
+set.seed(123)
+
+# Define Cross-Validation Parameters
+num_outer_folds <- 3  # Outer CV for model evaluation
+num_inner_folds <- 5  # Inner CV for hyperparameter tuning
+
+# Initialize Lists for Storing Results
+all_test_probs <- list()
+all_test_labels <- list()
+all_train_probs <- list()
+all_train_labels <- list()
+feature_importance_list <- list()
+results <- list()
+
+# Create Outer Cross-Validation Folds
+outer_folds <- createFolds(data$host_group, k = num_outer_folds, list = TRUE)
+
+for (fold in 1:num_outer_folds) {
+  print(paste("Outer Fold", fold, "of", num_outer_folds))
+  
+  # Split Data into Training & Testing Sets
+  testIndexes <- outer_folds[[fold]]
+  trainData <- data[-testIndexes, ]
+  testData  <- data[testIndexes, ]
+  
+    # Convert Features to Matrices
+  train_matrix <- as.matrix(trainData %>% select(-host_group))
+  test_matrix  <- as.matrix(testData %>% select(-host_group))
+
+  # Extract Labels & Convert to Numeric Format
+  train_label <- as.numeric(trainData$host_group) - 1
+  test_label  <- as.numeric(testData$host_group) - 1
+
+  num_classes <- length(unique(train_label))
+
+  # Compute class weights
+    class_counts <- table(train_label)
+    class_weights <- mean(class_counts) / class_counts
+    sample_weights <- class_weights[as.character(train_label)]
+    sample_weights <- sample_weights / mean(sample_weights)
+    
+  # Convert Data into XGBoost DMatrix Format
+  dtrain <- xgb.DMatrix(data = train_matrix, label = train_label, weight = sample_weights)
+  
+  # Define Hyperparameter Grid for Inner CV
+  param_grid <- expand.grid(
+    max_depth = c(1:3),
+    eta = c(0.002, 0.01, 0.1),
+    colsample_bytree = c(0.4, 0.6),
+    min_child_weight = c(6, 8),
+    subsample = c(0.5, 0.7),
+    lambda = c(5, 10),
+    alpha = c(2, 5)
+  )
+  
+  best_model <- NULL
+  best_logloss <- Inf
+  
+  # Inner Cross-Validation Loop (Hyperparameter Tuning)
+  for (i in 1:nrow(param_grid)) {
+    
+    print(paste("Grid search round ", i, " of ", nrow(param_grid)))
+    # print(paste("Grid search round", i, "of", nrow(param_grid)))
+    
+    params <- list(
+      objective = "multi:softprob",
+      eval_metric = "mlogloss",
+      num_class = num_classes,
+      max_depth = param_grid$max_depth[i],
+      eta = param_grid$eta[i],
+      colsample_bytree = param_grid$colsample_bytree[i],
+      min_child_weight = param_grid$min_child_weight[i],
+      subsample = param_grid$subsample[i]
+    )
+    
+    # Perform k-Fold Cross-Validation
+    cv_model <- xgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 300,
+      nfold = num_inner_folds,
+      stratified = TRUE,
+      early_stopping_rounds = 5,
+      verbose = 0,
+      nthread = 4
+    )
+    
+    best_logloss_cv <- min(cv_model$evaluation_log$test_mlogloss_mean)
+    
+    if (best_logloss_cv < best_logloss) {
+      best_logloss <- best_logloss_cv
+      best_model <- params
+      best_nrounds <- cv_model$best_iteration
+    }
+  }
+
+  # Train the Best Model on the Outer Training Data
+  final_model <- xgb.train(
+    params = best_model,
+    data = dtrain,
+    nrounds = best_nrounds,
+    verbose = 0,
+    nthread = 4
+  )
+  
+  # Make Predictions on Test Set
+  test_probs <- predict(final_model, test_matrix)
+  test_matrix_probs <- matrix(test_probs, ncol = length(unique(train_label)), byrow = TRUE)
+  test_pred_labels <- max.col(test_matrix_probs) - 1  
+  
+  ## --- Make Predictions on Train Set (for Overfitting Analysis) --- ##
+  train_probs <- predict(final_model, train_matrix)
+  train_matrix_probs <- matrix(train_probs, ncol = length(unique(train_label)), byrow = TRUE)
+  train_pred_labels <- max.col(train_matrix_probs) - 1  # Convert back to class labels
+
+  
+  # Store Predictions
+  all_test_probs[[fold]] <- test_matrix_probs
+  all_test_labels[[fold]] <- test_label
+  all_train_probs[[fold]] <- train_matrix_probs
+  all_train_labels[[fold]] <- train_label
+  
+  # Compute Feature Importance
+  feature_importance <- xgb.importance(model = final_model)
+  feature_importance_list[[fold]] <- feature_importance
+  
+  # Store Model and Predictions
+  results[[fold]] <- list(
+    model = final_model,
+    test_labels = test_label,
+    pred_probs = test_matrix_probs
+  )
+}
+
+# Aggregate Predictions Across Folds
+all_test_probs2 <- do.call(rbind, all_test_probs)
+all_test_labels2 <- unlist(all_test_labels)
+all_train_probs2 <- do.call(rbind, all_train_probs)
+all_train_labels2 <- unlist(all_train_labels)
+```
+
+save xgboost results
+```{r}
+# Create a list to store all results
+xgboost_results <- list(
+  all_test_probs = all_test_probs2,
+  all_test_labels = all_test_labels2,
+  all_train_probs = all_train_probs2,
+  all_train_labels = all_train_labels2,
+  feature_importance_list = feature_importance_list,
+  results = results
+)
+
+# Define file path
+save_path <- "../results/xgboost_results.RData"
+
+# Save the list
+save(xgboost_results, file = save_path)
+
+```
+
+```{r}
+### run to load saved results (to skip another run)
+load("../results/xgboost_results.RData")
+
+# Extract stored objects
+all_test_probs2 <- xgboost_results$all_test_probs
+all_test_labels2 <- xgboost_results$all_test_labels
+all_train_probs2 <- xgboost_results$all_train_probs
+all_train_labels2 <- xgboost_results$all_train_labels
+feature_importance_list <- xgboost_results$feature_importance_list
+results <- xgboost_results$results
+```
+
+## Confusion Matrices
+```{r}
+
+# Function to compute confusion matrix by classifying based on the highest probability
+create_confusion_matrix <- function(predictions, labels, num_classes = 3) {
+  # Apply the logic of selecting the class with the highest probability
+  predicted_labels <- apply(predictions, 1, function(row) {
+    which.max(row) - 1  # Find the class with the highest probability
+  })
+  
+  # Create confusion matrix
+  confusion <- caret::confusionMatrix(as.factor(predicted_labels), as.factor(labels))
+  
+  return(confusion)
+}
+
+
+# Manually split the data
+# Split sizes are fixed: 281, 280, and 280
+split1_indices <- 1:281
+split2_indices <- 282:561
+split3_indices <- 562:841
+
+# Model 1 (first 281 samples)
+model_1_probs <- all_test_probs2[split1_indices, ]
+model_1_labels <- all_test_labels2[split1_indices]
+
+# Model 2 (next 280 samples)
+model_2_probs <- all_test_probs2[split2_indices, ]
+model_2_labels <- all_test_labels2[split2_indices]
+
+# Model 3 (last 280 samples)
+model_3_probs <- all_test_probs2[split3_indices, ]
+model_3_labels <- all_test_labels2[split3_indices]
+
+# Compute confusion matrices for each model based on the highest probability classification
+
+# Model 1
+conf_matrix_1 <- create_confusion_matrix(model_1_probs, model_1_labels)
+print("Confusion Matrix for Model 1:")
+print(conf_matrix_1)
+
+# Model 2
+conf_matrix_2 <- create_confusion_matrix(model_2_probs, model_2_labels)
+print("Confusion Matrix for Model 2:")
+print(conf_matrix_2)
+
+# Model 3
+conf_matrix_3 <- create_confusion_matrix(model_3_probs, model_3_labels)
+print("Confusion Matrix for Model 3:")
+print(conf_matrix_3)
+
+```
+
+
+## Multi-Class ROC and PR Curves
+```{r}
+# Define number of classes
+num_classes <- length(unique(all_test_labels2))
+
+# Initialize lists to store ROC & PR curve data
+roc_list <- vector("list", num_classes)
+pr_list <- vector("list", num_classes)
+auc_values <- c()
+auprc_values <- c()
+
+# Compute ROC and PR curves for each class
+for (class in 0:(num_classes - 1)) {
+  roc_list[[class + 1]] <- roc(all_test_labels2 == class, all_test_probs2[, class + 1])
+  pr_list[[class + 1]] <- pr.curve(
+    scores.class0 = all_test_probs2[, class + 1], 
+    weights.class0 = (all_test_labels2 == class), 
+    curve = TRUE
+  )
+  
+  auc_values[class + 1] <- auc(roc_list[[class + 1]])  # Store AUC per class
+  auprc_values[class + 1] <- pr_list[[class + 1]]$auc.integral  # Store AUPRC per class
+}
+
+# Convert ROC Data for ggplot
+roc_data <- do.call(rbind, lapply(1:num_classes, function(i) {
+  data.frame(
+    FPR = 1 - roc_list[[i]]$specificities, 
+    TPR = roc_list[[i]]$sensitivities, 
+    Class = as.factor(i - 1)
+  )
+}))
+
+# Convert PR Data for ggplot
+pr_data <- do.call(rbind, lapply(1:num_classes, function(i) {
+  data.frame(
+    Recall = pr_list[[i]]$curve[,1], 
+    Precision = pr_list[[i]]$curve[,2], 
+    Class = as.factor(i - 1)
+  )
+}))
+
+# Compute baseline for PR curve (Prevalence of most abundant class - Class 0)
+prevalence_class0 <- mean(all_test_labels2 == 0)
+
+# **Plot Multi-Class ROC Curve**
+roc_plot <- ggplot(roc_data, aes(x = FPR, y = TPR, color = Class)) +
+  geom_line(size = 1) +
+  geom_abline(linetype = "dashed", color = "black", size = 0.5) +  # Random guessing baseline
+  labs(title = "ROC curve",
+       x = "False positive rate",
+       y = "True positive rate",
+        color = "Profile") +
+  theme_bw() + my_theme+
+  scale_color_manual(
+    values = colors[1:num_classes], 
+    labels = paste0((1:num_classes), " (AUC = ", round(auc_values, 3), ")")  
+  ) +
+  theme(
+    aspect.ratio = 1,  # Keep square aspect ratio
+    plot.title = element_text(hjust = 0.5, size = title_text_size, face = "bold"), 
+    legend.position = c(0.75, 0.19),  # Adjust legend inside the plot (x = right, y = bottom)
+    legend.background = element_rect(fill = ggplot2::alpha("white", 0.5), color = "black"),  
+    legend.key = element_rect(fill = "white", color = NA),  
+    legend.title = element_text(size = title_text_size-1, face = "bold"),  
+    legend.text = element_text(size = axis_text_size-1),  
+    legend.spacing.y = unit(0.05, "cm"),  
+    legend.key.size = unit(0.3, "cm") 
+  )
+
+
+prevalence_per_class <- sapply(0:(num_classes - 1), function(class) {
+  mean(all_test_labels2 == class)
+})
+
+# **Plot Multi-Class PR Curve**
+pr_plot <- ggplot(pr_data, aes(x = Recall, y = Precision, color = Class)) +
+  geom_line(size = 1) +
+    # Add multiple baseline lines for each class
+  geom_hline(yintercept = prevalence_per_class[1], linetype = "dashed", color = "black", size = 0.5) +
+  geom_hline(yintercept = prevalence_per_class[2], linetype = "dashed", color = "black", size = 0.5) +
+  geom_hline(yintercept = prevalence_per_class[3], linetype = "dashed", color = "black", size = 0.5) +
+  labs(title = "Precision-recall curve",
+       x = "Recall",
+       y = "Precision",
+      color = "Profile") +
+  theme_bw() + my_theme+
+  scale_color_manual(
+    values = colors[1:3], 
+    labels = paste0((1:num_classes), " (AUC = ", round(auprc_values, 3), ")")  # Updated labels format
+  ) +
+  theme(
+    aspect.ratio = 1,  # Keep square aspect ratio
+    plot.title = element_text(hjust = 0.5, size = title_text_size, face = "bold"), 
+    legend.position = c(0.75, 0.82),  # Adjust legend inside the plot (x = right, y = bottom)
+    legend.background = element_rect(fill = ggplot2::alpha("white", 0.6), color = "black"),  
+    legend.key = element_rect(fill = "white", color = NA),  
+    legend.title = element_text(size = title_text_size-1, face = "bold"),  
+    legend.text = element_text(size = axis_text_size-1),  
+    legend.spacing.y = unit(0.05, "cm"),  
+    legend.key.size = unit(0.3, "cm")    
+  ) +
+  # Add baseline labels dynamically
+  annotate("text", x = 0.2, y = prevalence_per_class[1] + 0.04, 
+           label = paste("Baseline-1 =", round(prevalence_per_class[1], 3)), color = "black", size = axis_text_size - 5) +
+  annotate("text", x = 0.2, y = prevalence_per_class[2] + 0.04, 
+           label = paste("Baseline-2 =", round(prevalence_per_class[2], 3)), color = "black", size = axis_text_size - 5) +
+  annotate("text", x = 0.2, y = prevalence_per_class[3] + 0.04, 
+           label = paste("Baseline-3 =", round(prevalence_per_class[3], 3)), color = "black", size = axis_text_size - 5)
+
+
+# Display ROC and PR Curves
+print(roc_plot)
+print(pr_plot)
+
+```
+
+## Performance Metrics
+```{r}
+# function for calculating MCC
+compute_mcc <- function(conf_matrix) {
+  
+  # Get the raw confusion matrix
+  cm_table <- conf_matrix$table  
+
+  # Compute MCC components
+  S <- sum(cm_table)  # Total samples
+  row_sums <- rowSums(cm_table)  # Actual class counts
+  col_sums <- colSums(cm_table)  # Predicted class counts
+  true_positives <- diag(cm_table)  # True Positives (diagonal)
+  
+  # Compute numerator & denominator
+  numerator <- sum(true_positives * S) - sum(row_sums * col_sums)
+  denominator <- sqrt((S^2 - sum(row_sums^2)) * (S^2 - sum(col_sums^2)))
+  
+  # Avoid division by zero
+  if (denominator == 0) {
+    mcc <- 0  # MCC is undefined when denominator is zero
+  } else {
+    mcc <- numerator / denominator
+  }
+  
+  return(mcc)
+
+}
+
+```
+
+
+Compute Confusion Matrix Metrics for Mean CV Performance vs. Theoretical Random
+```{r}
+
+# Store performance metrics across folds (XGBoost & Random)
+cv_metrics <- data.frame(Fold = integer(),
+                         Accuracy = numeric(),
+                         Weighted_Precision = numeric(),
+                         Weighted_Recall = numeric(),
+                         Weighted_F1 = numeric(),
+                         Weighted_Balanced_Accuracy = numeric(),
+                         MCC = numeric())
+
+random_cv_metrics <- data.frame(Fold = integer(),
+                                Accuracy = numeric(),
+                                Weighted_Precision = numeric(),
+                                Weighted_Recall = numeric(),
+                                Weighted_F1 = numeric(),
+                                Weighted_Balanced_Accuracy = numeric(),
+                                MCC = numeric())
+
+for (fold in 1:num_outer_folds) {
+  pred_labels <- max.col(all_test_probs[[fold]]) - 1  # Convert back to class labels
+  true_labels <- all_test_labels[[fold]]
+  
+  # Compute confusion matrix
+  conf_matrix <- caret::confusionMatrix(as.factor(pred_labels), as.factor(true_labels))
+  
+  # Compute class distribution for weighted averaging
+  class_distribution <- table(true_labels) / length(true_labels)
+  
+  # --- Compute XGBoost Metrics ---
+  weighted_precision <- sum(conf_matrix$byClass[, "Precision"] * class_distribution, na.rm = TRUE)
+  weighted_recall <- sum(conf_matrix$byClass[, "Recall"] * class_distribution, na.rm = TRUE)
+  weighted_f1 <- sum(conf_matrix$byClass[, "F1"] * class_distribution, na.rm = TRUE)
+  weighted_balanced_accuracy <- sum(conf_matrix$byClass[, "Balanced Accuracy"] * class_distribution, na.rm = TRUE)
+  
+  # Compute MCC
+  mcc <- compute_mcc(conf_matrix)
+  
+  # Store XGBoost results
+  cv_metrics <- rbind(cv_metrics, data.frame(Fold = fold,
+                                             Accuracy = conf_matrix$overall["Accuracy"],
+                                             Weighted_Precision = weighted_precision,
+                                             Weighted_Recall = weighted_recall,
+                                             Weighted_F1 = weighted_f1,
+                                             Weighted_Balanced_Accuracy = weighted_balanced_accuracy,
+                                             MCC = mcc))
+  
+  # --- Compute Theoretical Random Performance for This Fold ---
+  # Expected accuracy from class prevalence
+  random_accuracy <- sum(class_distribution^2)  
+  
+  # Expected precision from class prevalence
+  random_weighted_precision <- sum(class_distribution * class_distribution)  
+  
+  # Expected recall from class prevalence
+  random_weighted_recall <- sum(class_distribution * class_distribution)
+  
+  # Expected F1-score
+  random_f1 <- 2 * ((random_weighted_precision * random_weighted_recall) / 
+                      (random_weighted_precision + random_weighted_recall))  
+  
+  # Balanced accuracy always 1/No. of classes for a random classifier
+  random_balanced_accuracy <- 1/3  
+  
+  # Theoretical MCC for a perfect random classifier is 0
+  random_mcc <- 0  
+  
+  # Store Theoretical Random Results
+  random_cv_metrics <- rbind(random_cv_metrics, data.frame(Fold = fold,
+                                                           Accuracy = random_accuracy,
+                                                           Weighted_Precision = random_weighted_precision,
+                                                           Weighted_Recall = random_weighted_recall,
+                                                           Weighted_F1 = random_f1,
+                                                           Weighted_Balanced_Accuracy = random_balanced_accuracy,
+                                                           MCC = random_mcc))
+}
+
+# --- Compute Mean and SD for Model Performance ---
+mean_metrics <- colMeans(cv_metrics[, -1], na.rm = TRUE)
+sd_metrics <- apply(cv_metrics[, -1], 2, sd, na.rm = TRUE)
+
+random_mean_metrics <- colMeans(random_cv_metrics[, -1], na.rm = TRUE)
+random_sd_metrics <- apply(random_cv_metrics[, -1], 2, sd, na.rm = TRUE)
+
+# --- Create a DataFrame for Visualization ---
+metrics_df <- data.frame(
+  Metric = rep(c("Accuracy", "W-Precision", "W-Recall", 
+                 "W-F1", "WBA", "MCC"), 2),  # Shortened names for display
+  Value = c(mean_metrics["Accuracy"], mean_metrics["Weighted_Precision"], mean_metrics["Weighted_Recall"], 
+            mean_metrics["Weighted_F1"], mean_metrics["Weighted_Balanced_Accuracy"], mean_metrics["MCC"],
+            random_mean_metrics["Accuracy"], random_mean_metrics["Weighted_Precision"], 
+            random_mean_metrics["Weighted_Recall"], random_mean_metrics["Weighted_F1"], 
+            random_mean_metrics["Weighted_Balanced_Accuracy"], random_mean_metrics["MCC"]),
+  SD = c(sd_metrics["Accuracy"], sd_metrics["Weighted_Precision"], sd_metrics["Weighted_Recall"], 
+         sd_metrics["Weighted_F1"], sd_metrics["Weighted_Balanced_Accuracy"], sd_metrics["MCC"],
+         random_sd_metrics["Accuracy"], random_sd_metrics["Weighted_Precision"], 
+         random_sd_metrics["Weighted_Recall"], random_sd_metrics["Weighted_F1"], 
+         random_sd_metrics["Weighted_Balanced_Accuracy"], random_sd_metrics["MCC"]),
+  Type = rep(c("XGBoost", "No-skill"), each = 6)
+)
+
+# Define correct factor levels for ordered display
+metric_levels <- c("Accuracy", "W-Precision", "W-Recall", 
+                   "W-F1", "WBA", "MCC")
+metrics_df$Metric <- factor(metrics_df$Metric, levels = metric_levels, ordered = TRUE)
+
+# --- Plot Model Performance vs. Random Guessing with SD Bars ---
+metrics_plot <- ggplot(metrics_df, aes(x = Metric, y = Value, fill = Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), color = "black") +
+  geom_errorbar(aes(ymin = Value - SD, ymax = Value + SD), 
+                position = position_dodge(width = 0.7), width = 0.2, color = "black") +
+  labs(y = "Score",
+       x = "",
+       fill="Model") +
+  scale_fill_manual(values = c("XGBoost" = "steelblue",  # XGBoost Performance
+                               "No-skill" = "grey")) + # Theoretical Random Guessing Performance
+  my_theme +
+  theme(aspect.ratio = 0.5,
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# Print the plot
+print(metrics_plot)
+
+```
+
+Performance Figure
+```{r, fig.width=6, fig.height=6}
+# Arrange Metrics (A), ROC (B), and PR (C) in a single figure
+fig_performance <- ggarrange(
+  metrics_plot,  # Panel A: Metrics comparison
+  ggarrange(roc_plot, pr_plot , ncol = 2, labels = c("B", "C"), common.legend = FALSE),
+  ncol = 1, nrow = 2, labels = c("A", "")
+)
+
+# Display the final combined plot
+fig_performance
+```
+
+
+# SHAP
+
+## SHAP analysis
+```{r}
+library(shapviz)
+
+# Store SHAP values for each fold
+shap_values_list <- list()
+
+for (fold in 1:num_outer_folds) {
+  print(paste("Computing SHAP values for fold", fold, "of", num_outer_folds))
+  
+  # Get trained model for this fold
+  best_model <- results[[fold]]$model
+  
+  # Extract test data for this fold
+  test_data <- data[outer_folds[[fold]], ]  
+  # Convert features to matrix
+  test_matrix <- as.matrix(test_data %>% select(-host_group))  
+  
+  # Generate unique row-based IDs
+  test_data$sample_ID <- paste0("Fold_", fold, "_Row_", 1:nrow(test_data))
+  
+  # Generate SHAP explainer
+  explainer <- shapviz(best_model, X_pred = test_matrix)
+  
+  # Store SHAP values for all classes separately
+  fold_shap_values <- list()
+  
+  for (class_name in names(explainer)) {
+    
+    # Extract SHAP values
+    class_shap <- as.data.frame(explainer[[class_name]]$S)  
+    
+    #️ Fix: Ensure metadata columns (Class, sample_ID) are included
+    class_shap$Class <- class_name  
+    class_shap$sample_ID <- test_data$sample_ID  # Assign generated ID
+    
+    fold_shap_values[[class_name]] <- class_shap
+  }
+  
+  # Combine SHAP values for this fold
+  shap_values_list[[fold]] <- bind_rows(fold_shap_values)
+}
+
+#️ Fix: Ensure `sample_ID` exists before proceeding
+all_shap_values <- bind_rows(shap_values_list)
+
+# Check structure
+str(all_shap_values)  # Verify sample_ID is present
+
+shap_long <- pivot_longer(all_shap_values,  
+                          cols = -c(Class, sample_ID),  # Keep Class & sample_ID
+                          names_to = "Feature",  
+                          values_to = "SHAP_Value")
+
+# Extract feature values for test data across all folds
+feature_values_list <- list()
+
+for (fold in 1:num_outer_folds) {
+  test_data <- data[outer_folds[[fold]], ]  
+  test_data$sample_ID <- paste0("Fold_", fold, "_Row_", 1:nrow(test_data))  # Ensure same IDs
+  
+  # Convert to long format
+  feature_long <- pivot_longer(test_data,  
+                               cols = -c(host_group, sample_ID),  # Keep sample_ID
+                               names_to = "Feature",  
+                               values_to = "Feature_Value")
+  
+  feature_values_list[[fold]] <- feature_long
+}
+
+# Combine feature values across folds
+all_feature_values <- bind_rows(feature_values_list)
+
+# Merge SHAP values with corresponding feature values
+shap_full_data <- shap_long %>%
+  left_join(all_feature_values, by = c("sample_ID", "Feature"))
+
+# Compute SHAP Importance (Mean Absolute Value)
+shap_summary <- shap_full_data %>%
+  group_by(Feature, Class) %>%
+  summarise(Mean_SHAP = mean(abs(SHAP_Value)), .groups = "drop") %>%
+  arrange(desc(Mean_SHAP))
+```
+
+Feature Importance Plot
+```{r}
+# Define feature names
+feature_names <- c(
+  "avg_non_native" = "Non-native density",
+  "avg_rattus" = "Rat density",
+  "avg_native" = "Native density",
+  "dist_village" = "Village distance",
+  "veg_season_pc1" = "Vegetation PC1",
+  "veg_season_pc2" = "Vegetation PC2",
+  "Prevotellaceae" = "Prevotellaceae",
+  "Muribaculaceae" = "Muribaculaceae",
+  "Lactobacillaceae" = "Lactobacillaceae",
+  "Lachnospiraceae" = "Lachnospiraceae",
+  "nc_inf" = "Nematode co-infection",
+  "mass" = "Body mass",
+  "sex" = "Sex",
+  "BCI_residual" = "Body condition",
+  "age_repro" = "Age"
+)
+
+# Modify the dataset: rename features
+shap_summary_new <- shap_summary %>%
+  dplyr::rename("old_feature"="Feature") %>%
+  mutate(Feature = recode(old_feature, !!!feature_names)) %>% 
+  mutate(Class = factor(Class, levels = c("Class_3", "Class_2", "Class_1")))
+
+# Plot SHAP feature importance with updated names
+importance_plot <- ggplot(shap_summary_new, aes(x = reorder(Feature, Mean_SHAP), y = Mean_SHAP, fill = Class)) +
+  geom_bar(stat = "identity", alpha = 1) +
+  coord_flip() +
+  xlab("Features") +
+  ylab("Mean SHAP absolute value") + # Mean(|SHAP Value|) across CV folds
+  scale_fill_manual(name = "Profile", values = colors[3:1], labels = c("1", "2", "3")) +
+  theme_minimal() +
+  my_theme +
+  theme(legend.position = "none", 
+        aspect.ratio = 1.5) 
+
+importance_plot
+```
+Importance by category
+```{r}
+# Define categories for each feature
+feature_categories <- c(
+  "avg_non_native" = "Environmental",
+  "avg_rattus" = "Environmental",
+  "avg_native" = "Environmental",
+  "dist_village" = "Environmental",
+  "veg_season_pc1" = "Environmental",
+  "veg_season_pc2" = "Environmental",
+  "Prevotellaceae" = "Physiological",
+  "Muribaculaceae" = "Physiological",
+  "Lactobacillaceae" = "Physiological",
+  "Lachnospiraceae" = "Physiological",
+  "nc_inf" = "Physiological",
+  "mass" = "Physiological",
+  "sex" = "Physiological",
+  "BCI_residual" = "Physiological",
+  "age_repro" = "Physiological"
+)
+
+
+# Add category column to the dataset
+shap_summary_cat <- shap_summary %>%
+  dplyr::rename("old_feature"="Feature") %>%
+  mutate(Category = recode(old_feature, !!!feature_categories))
+
+# Aggregate SHAP values by Category and Class
+shap_category_sum <- shap_summary_cat %>%
+  group_by(Category, Class) %>%
+  summarise(Total_SHAP = sum(Mean_SHAP, na.rm = TRUE), .groups = "drop")
+
+shap_category_sum_summary <- shap_category_sum %>% 
+  group_by(Category) %>% 
+  summarise(sum = sum(Total_SHAP))
+
+# Convert Class to a factor to ensure correct color mapping
+shap_category_sum$Class <- factor(shap_category_sum$Class, levels = c("Class_3", "Class_2", "Class_1"))
+
+# Plot aggregated SHAP values by category with color by Class
+agg_plot <- ggplot(shap_category_sum, aes(x = reorder(Category, Total_SHAP), y = Total_SHAP, fill = Class)) +
+  geom_bar(stat = "identity", position = "stack") + 
+  labs(x = "Category",
+       y = "Mean SHAP absolute value",
+       fill = "Profile") +
+  theme_bw() +
+  scale_fill_manual(values = colors[3:1], labels = c("3", "2", "1")) +
+  my_theme +
+  theme(legend.position = "bottom",
+        aspect.ratio = 1)
+
+agg_plot
+```
+
+```{r, fig.width=10, fig.height=6}
+# Arrange all plots
+fig_shap <- ggarrange(
+  importance_plot,
+  agg_plot,
+  ncol = 2, nrow = 1,
+  labels = c("A", "B"),
+  common.legend = TRUE,
+  legend = "bottom"
+  )
+
+# Display the final combined plot
+print(fig_shap)
+```
+
+
+## Dependece plots
+
+```{r}
+# Get Top 6 Most Important Features
+top_features <- shap_summary_new %>%
+  group_by(Feature) %>%
+  summarise(Overall_SHAP = sum(Mean_SHAP)) %>%
+  arrange(desc(Overall_SHAP)) %>%
+  slice_head(n = 6) %>%
+  pull(Feature)
+
+# Show the most important features
+print(top_features)  
+
+# Rename features in shap_full_data
+shap_full_data2 <- shap_full_data %>%
+  mutate(Feature = recode(Feature, !!!feature_names))
+
+# Filter data for only the top features (after renaming)
+shap_top_data <- shap_full_data2 %>%
+  filter(Feature %in% top_features)  %>% 
+  mutate(Feature = factor(Feature, levels = c("Body mass","Prevotellaceae","Muribaculaceae","Non-native density","Rat density","Vegetation PC1")))
+
+
+# SHAP Dependence Plots for the Top 6 Features
+
+dependence_plot <- shap_top_data %>% 
+  ggplot(aes(x = Feature_Value, y = SHAP_Value, color = Class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#d9d9d9", size = 0.8) +  # Horizontal reference line at y = 0
+  geom_smooth(method = "loess", se = TRUE, size = 1) +  # Add trend line
+  facet_wrap(~ Feature, scales = "free") +  
+  xlab("Feature values") +
+  ylab("SHAP values") +
+  theme_minimal() +
+  scale_color_manual(
+    name = "Profile", 
+    values = c(colors[1:3]),
+    labels = c("1", "2", "3")
+  ) +
+  my_theme +
+  theme(
+    strip.background = element_rect(fill = "#d9d9d9"),
+    legend.position = "bottom",  
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 10), strip.text = element_text(size=12),axis.title=element_text(size=14), aspect.ratio = 1
+  )
+
+dependence_plot
+
+```
+
+```{r}
+# all features - for SI
+library(scales)
+
+# Get Top 15 Most Important Features
+top_features <- shap_summary_new %>%
+  group_by(Feature) %>%
+  summarise(Overall_SHAP = sum(Mean_SHAP)) %>%
+  arrange(desc(Overall_SHAP)) %>%
+  slice_head(n = 15) %>%
+  pull(Feature)
+
+# Rename features in shap_full_data
+shap_full_data <- shap_full_data %>%
+  mutate(Feature = recode(Feature, !!!feature_names))
+
+# Filter data for only the top features (after renaming)
+shap_top_data <- shap_full_data %>%
+  filter(Feature %in% top_features)  
+
+# SHAP Dependence Plots for the Top 15 Features
+dependence_plot <- shap_top_data %>% 
+  ggplot(aes(x = Feature_Value, y = SHAP_Value, color = Class)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#d9d9d9", size = 0.8) +  # Horizontal reference line at y = 0
+  geom_smooth(method = "loess", se = TRUE, size = 1) +  # Add trend line
+  facet_wrap(~ Feature, scales = "free", ncol=3) +  # One plot per feature
+  scale_y_continuous(labels = label_number(accuracy = 0.1))+
+  xlab("Feature values") +
+  ylab("SHAP values") +
+  theme_minimal() +
+  scale_color_manual(
+    name = "Profile",  
+    values = c(colors[1:3]),  
+    labels = c("1", "2", "3") 
+  ) +
+  my_theme +
+  theme(
+    plot.margin=unit(c(0,0,0,0), 'pt'),
+    strip.background = element_rect(fill = "#d9d9d9"),
+    legend.position = "bottom", 
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 10), strip.text = element_text(size=6),axis.title=element_text(size=10), aspect.ratio = 1,
+    axis.text=element_text(size=5)
+  )
+
+#pdf('../results/figures/shap_all.pdf')
+dependence_plot
+dev.off()
+```
+

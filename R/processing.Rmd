@@ -1,0 +1,698 @@
+---
+title: "Infection profiles in a wild rat–protozoan network are shaped by host traits and environmental factors"
+subtitle: "Processing the data"
+date: "Last edit: 2025-08-05"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    collapse: false
+    number_sections: true
+    code_folding: hide
+    highlight: tango
+---
+
+```{r load libraries and set parameters}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(vegan)
+
+rm(list=ls())
+
+# load the host-protozoa data
+G4_long_otu <- read_csv("../data/data_processed/G4_long_otu.csv") 
+
+```
+
+# Nematode processing
+
+infected by NC or not (0/1)
+
+```{r}
+NC_long_otu <- read_csv("../data/data_processed/NC_long_otu.csv")
+
+# transforming to matrix
+NC_infection <- NC_long_otu %>% 
+  select(host_ID, otu_ID, link) %>%
+  spread(otu_ID, link, fill = 0) %>% 
+  mutate(NC_sum = rowSums(select(., !starts_with("host")))) %>% 
+  select(host_ID, NC_sum) %>% 
+  mutate(nc_inf = ifelse(NC_sum>0,1,0)) %>% 
+  mutate(host_ID = as.numeric(host_ID))
+
+# plotting nematode infection distribution
+
+# filter only relevant hosts
+hosts <- G4_long_otu %>% 
+  distinct(host_ID)
+
+#pdf('../results/figures/nc_distribution.pdf')
+NC_infection %>% 
+  filter(host_ID %in% hosts$host_ID) %>% 
+  ggplot(aes(x = NC_sum)) +
+  geom_histogram(binwidth = 1, color = "black") +
+  theme_bw() +
+  scale_x_continuous(breaks = 0:9)+
+  theme(panel.grid = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+        axis.title = element_text(size=12, color = "black", face = "bold"),
+        axis.text = element_text(size=10, color = "black"),
+        legend.text = element_text(size = 10), 
+        legend.title = element_text(size = 12)
+  ) +  
+  labs(x = "No. of nematodes", y = "No. of hosts") +
+  theme(aspect.ratio=1) 
+dev.off()
+```
+
+
+# Microbiome processing
+
+PCA for the microbial families
+
+```{r}
+# microbiome asv data
+data_asv <- read_csv("../data/data_processed/data_asv_rra0.001_p0.01_th5000_all.csv")
+
+# microbes taxonomy
+tax <- read_delim("../data/data_raw/microbiome/ASVs_taxonomy_new.tsv") %>% 
+  dplyr::rename(asv_ID = ASV)
+
+data_asv_tax <- data_asv %>% 
+  left_join(tax, by="asv_ID")
+
+# how much are classified into families?
+families <- data_asv_tax %>% 
+  distinct(asv_ID, Family) %>% 
+  mutate(classified = !is.na(Family))
+table(families$classified)  # FALSE= unknown Family
+# 1770/1951 = 0.907
+
+# how many families?
+length(unique(data_asv_tax$Family)) # 55 + NA
+
+# aggregating by Family level
+data_asv_family <- data_asv_tax %>% 
+  group_by(host_ID, Family) %>% 
+  summarise(reads = sum(reads)) %>% 
+  filter(!is.na(Family))
+
+# matrix
+data_asv_family_mat <- data_asv_family %>% 
+  spread(Family, reads, fill = 0) %>% 
+  column_to_rownames("host_ID") %>% 
+  as.matrix()
+
+
+#PCoA
+set.seed(123)
+# PCoA via Bray-Curtis
+bray_dist <- vegdist(data_asv_family_mat, method = "bray")
+pcoa_result <- cmdscale(bray_dist, k = nrow(data_asv_family_mat) - 1, eig = TRUE)
+
+
+# Explained Variance
+eig_vals <- pcoa_result$eig
+explained_var <- eig_vals / sum(eig_vals) * 100
+
+# Most Important ASVs via correlation with PC axes
+asv_correlation <- cor(data_asv_family_mat, pcoa_result$points[, 1:2])  # columns = PC1, PC2
+
+# Get top 2 ASVs per PC
+top_asvs_pc1 <- sort(abs(asv_correlation[, 1]), decreasing = TRUE)[1:2]
+top_asvs_pc2 <- sort(abs(asv_correlation[, 2]), decreasing = TRUE)[1:2]
+top_asvs <- union(names(top_asvs_pc1), names(top_asvs_pc2))  # combined top ASVs
+
+# Prepare vectors for arrows
+arrows_df <- data.frame(
+  ASV = top_asvs,
+  PC1 = asv_correlation[top_asvs, 1],
+  PC2 = asv_correlation[top_asvs, 2]
+)
+
+# Scale arrows for plotting
+arrow_scaling_factor <- 0.5  # adjust for aesthetics
+arrows_df$PC1 <- arrows_df$PC1 * arrow_scaling_factor
+arrows_df$PC2 <- arrows_df$PC2 * arrow_scaling_factor
+
+# Create a circle (for correlation circle)
+radius <- (2/55)^0.5
+# Create a circle scaled by the computed radius
+circle_data <- data.frame(
+  x = radius * cos(seq(0, 2 * pi, length.out = 100)),
+  y = radius * sin(seq(0, 2 * pi, length.out = 100))
+)
+
+# Ordination plot (samples + top ASVs as arrows)
+ordination_df <- as.data.frame(pcoa_result$points[, 1:2])
+colnames(ordination_df) <- c("PC1", "PC2")
+
+#pdf('../results/figures/microbiome_pcoa.pdf')
+ggplot(ordination_df, aes(x = PC1, y = PC2)) +
+  geom_point(size = 2, color = "steelblue", alpha = 0.8) +
+  geom_path(data = circle_data, aes(x, y), linetype = "dashed") +
+  geom_segment(data = arrows_df, aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.2, "cm")), color = "black") +
+  geom_text(data = arrows_df, aes(x = PC1, y = PC2, label = ASV),
+            color = "darkred", hjust = 0.5, vjust = -1, size = 3.5) +
+  labs(x = paste0("PC1 (", round(explained_var[1], 1), "%)"),
+       y = paste0("PC2 (", round(explained_var[2], 1), "%)")) +
+  theme_bw()
+dev.off()
+
+# making the microbiome table
+# relative abundance
+microbiome_family <- c("Lachnospiraceae","Lactobacillaceae","Muribaculaceae","Prevotellaceae")
+microbiome_df <- data_asv_family %>% 
+  filter(Family %in% microbiome_family) %>% 
+  spread(Family, reads, fill = 0)
+
+```
+
+
+
+# Grid vegetation processing
+
+PCA of vegetation per village per grid per season
+
+```{r}
+habitat.raw <- read_csv("../data/data_raw/small_mammals/Trap_Plots.csv") %>% 
+  mutate(season = ifelse(is.na(season), 3, season))
+
+habitat <- habitat.raw %>% 
+  mutate(grid_name = case_when(grid_name=="Primary forest" ~ "semi-intact_forest",
+                               grid_name=="Degraded forest" ~ "semi-intact_forest",
+                               grid_name=="Secondary forest" ~ "secondary_forest",
+                               grid_name=="Savoka" ~ "brushy_regrowth",
+                               grid_name=="Sugar cane" ~ "agriculture",
+                               grid_name=="Mixed agricultural fields" ~ "agriculture",
+                               grid_name=="Vanilla, coffee, banana fields" ~ "agriculture",
+                               grid_name=="Rice field" ~ "flooded_rice",
+                               grid_name=="Vanilla" ~ "agroforest",
+                               grid_name=="Village" ~ "village")) %>% 
+  select(village, grid_name, season, plot, square, dead_logs, tree_dbh, tree_height, #omiting crown distance
+         liana_number, herbaceous_height, herbaceous_cover, canopy_cover) #omitting observations and season
+
+## deal with multitrunk trees by taking sqrt of sum of square DBH of each stem
+habitat <- habitat %>% 
+  separate(tree_dbh, c("dbh1", "dbh2", "dbh3"), sep = ",") %>% #using unique(habitat$tree_dbh) see max of 3 stems, give each their own column
+  mutate(across(c(dbh1, dbh2, dbh3), as.numeric), #make numeric
+         across(c(dbh1, dbh2, dbh3), ~ifelse(is.na(.x), 0, .x)), #make na into 0
+         tree_dbh = dbh1^2+dbh2^2+dbh3^2, #sum sq dbhs
+         tree_dbh = ifelse(tree_dbh == 0, NA, sqrt(tree_dbh))) %>% #sqrt of sum, if 0 make NA (no trees)
+  select(-dbh1, -dbh2, -dbh3)
+## deal with the herbaceous_height "x to x"
+habitat <- habitat %>% 
+  mutate(herbaceous_height = case_when(herbaceous_height == "0.4 to 1.5" ~ mean(c(0.4, 1.5)),
+                                       herbaceous_height == "1.5 to 2" ~ mean(c(1.5, 2)),
+                                       herbaceous_height == "0.3 to 1" ~ mean(c(0.3, 1)), 
+                                       herbaceous_height == "0,3 to 1" ~ mean(c(0.3, 1)), 
+                                       herbaceous_height == "0 to 1" ~ mean(c(0, 1)),
+                                       herbaceous_height == "0 to 2" ~ mean(c(0, 2)), 
+                                       TRUE ~ as.numeric(herbaceous_height)))
+# add pitfall column
+habitat <- habitat %>% 
+  mutate(pitfall = ifelse(str_detect(plot, "Pitfall"), "Pitfall", "Grid"),
+         pitfall_line = case_when(str_detect(plot, "Pitfall 1") ~ 1,
+                                  str_detect(plot, "Pitfall 2") ~ 2,
+                                  str_detect(plot, "Pitfall 3") ~ 3,
+                                  str_detect(plot, "Pitfall 4") ~ 4,
+                                  str_detect(plot, "Pitfall 5") ~ 5,
+                                  str_detect(plot, "Pitfall 6") ~ 6,
+                                  str_detect(plot, "Pitfall 7") ~ 7,
+                                  str_detect(plot, "Pitfall 8") ~ 8,
+                                  str_detect(plot, "Pitfall 9") ~ 9,
+                                  str_detect(plot, "Pitfall 10") ~ 10,
+                                  str_detect(plot, "Pitfall 11") ~ 11,
+                                  str_detect(plot, "Pitfall 12") ~ 12,
+                                  TRUE ~ 0))
+
+## make a trees df
+trees <- habitat %>% 
+  select(village, grid_name, season, pitfall, plot, square, tree_height, tree_dbh) %>% 
+  group_by(village, grid_name,season, plot, square) %>%
+  summarise(tree_height = mean(tree_height, na.rm=T),
+            tree_dbh = mean(tree_dbh, na.rm=T))
+
+## create a new df individual tree measurements
+squares <- habitat %>% 
+  mutate(tree = ifelse(is.na(tree_dbh), 0, 1)) %>% ## count the number of trees in each square
+  group_by(village, grid_name, season, plot, square) %>% 
+  mutate(n_trees = sum(tree)) %>% 
+  ungroup() %>% 
+  select(-tree_height, -tree_dbh, -tree) %>% # remove tree info from habitat
+  distinct() %>% 
+  left_join(trees, by=c("village","grid_name","season","plot","square"))
+
+# summarizing for plots
+plot_sum <- squares %>% 
+  mutate(across(c(n_trees, tree_height, tree_dbh, dead_logs, 
+                  liana_number, herbaceous_height, 
+                  herbaceous_cover, canopy_cover))) %>% 
+  group_by(pitfall, pitfall_line, village, grid_name, season, plot) %>% 
+  summarise(n_trees = sum(n_trees, na.rm=T),
+            tree_height = mean(tree_height, na.rm=T),
+            tree_dbh = mean(tree_dbh, na.rm=T),
+            n_logs = sum(dead_logs, na.rm=T),
+            n_liana = sum(liana_number, na.rm=T),
+            m_herb_ht = mean(herbaceous_height, na.rm=T),
+            m_herb_cv = mean(herbaceous_cover, na.rm = T),
+            m_canopy_cv = mean(canopy_cover, na.rm = T)) %>% 
+  ungroup() %>% 
+  mutate(across(everything(), ~replace(. , is.nan(.), 0)))
+
+# summarizing for grids
+grid_sum <- plot_sum %>% 
+  filter(pitfall == "Grid") %>% 
+  group_by(grid_name, season, village) %>% 
+  summarise_at(vars(4:11), ~mean(., na.rm=TRUE)) %>% 
+  ungroup() %>% 
+  arrange(grid_name) %>% 
+  mutate(grid_name = factor(grid_name))
+
+# adding village values
+village_values <- grid_sum %>%
+  group_by(village,season) %>%
+  summarise(across(where(is.numeric), min, na.rm = TRUE)) %>% # herb trait are the minimal by village and season
+  mutate(n_trees = 0, tree_height = 0, tree_dbh = 0, m_canopy_cv = 0, n_logs = 0, n_liana = 0) %>% # no trees, logs, lianas...
+  mutate(grid_name = "village")
+
+grid_sum <- rbind(grid_sum, village_values)
+
+# name index
+grid_season_name <- grid_sum %>% 
+  select(grid_name, season, village) %>% 
+  unite(col="grid_season", grid_name:village, remove = FALSE)
+
+# transforming to matrix
+grid_sum_mat <- grid_sum %>% 
+  unite(col="grid_season", grid_name:village, remove = TRUE) %>%
+  column_to_rownames("grid_season") %>%
+  ungroup() %>% 
+  as.matrix() 
+
+
+# PCA
+# variables transformed to centered 0 and rescale to have unit variance before the analysis 
+set.seed(123)
+pca_veg <- prcomp(grid_sum_mat, center = TRUE, scale. = TRUE)
+
+vegetation_pca <- as.data.frame(pca_veg$x) %>% 
+  rownames_to_column("grid_season") %>% 
+  left_join(grid_season_name, by="grid_season")
+
+# explained variance
+ex_var <- pca_veg$sdev ^2 
+prop_ex_var <- ex_var/sum(ex_var)*100
+sum(prop_ex_var[1:2]) # first two explained variance 80.7%
+
+# Convert row names to a data frame
+pca_data <- data.frame(pca_veg$x[, 1:2]) %>%  # Select the first two principal components
+  rownames_to_column(var = "site") %>%
+  mutate(
+    land_use = str_extract(site, "^[^0-9]+") %>% str_remove("_$"),  # Capture everything before the first number
+    season = str_extract(site, "(?<=_)[0-9]+(?=_)"),  # Extract the number in between underscores
+    village = str_extract(site, "[^_]+$")  # Capture the last part (village)
+  )
+
+pca_data$land_use <- recode(pca_data$land_use, 
+                            "brushy_regrowth" = "Savoka",
+                            "agriculture" = "Mixed agriculture",
+                            "village" = "Village",
+                            "secondary_forest" = "Secondary forest",
+                            "flooded_rice" = "Flooded rice",
+                            "agroforest" = "Agroforest",
+                            "semi-intact_forest" = "Semi-intact forest",
+                            "village" = "Village")
+
+pca_data$land_use <- factor(pca_data$land_use, levels = c("Semi-intact forest", "Secondary forest", "Savoka", "Mixed agriculture", "Agroforest","Flooded rice", "Village")) # Order the levels by habitat disturbance
+
+loadings <- data.frame(pca_veg$rotation[, 1:2], variable = rownames(pca_veg$rotation)) %>%
+  mutate(variable = recode(variable,
+                           "n_trees" = "No. of trees",
+                           "tree_height" = "Avg. tree height",
+                           "tree_dbh" = "Avg. tree diameter",
+                           "n_logs" = "No. of dead logs",
+                           "n_liana" = "No. of lianas",
+                           "m_herb_ht" = "Avg. herbaceous height",
+                           "m_herb_cv" = "Avg. herbaceous cover",
+                           "m_canopy_cv" = "Avg. canopy cover"
+  ))
+
+scaling_factor <- 5
+
+veg_colors <- c("#4d9221", "#7fbc41", "#b8e186", "#f1b6da", "#de77ae", "#c51b7d", "#8e0152")
+
+veg_plot <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point(size = 3, aes(color = land_use, shape = village)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_segment(data = loadings, aes(x = 0, y = 0, xend = PC1*scaling_factor, yend = PC2*scaling_factor), 
+               arrow = arrow(length = unit(0.2, "cm")), color = "darkgrey") +  # Vectors as arrows
+  geom_text(data = loadings, aes(x = PC1*scaling_factor*1.15, y = PC2*scaling_factor*1.05, label = variable),
+            color = "black", size = 3) +  # Variable names near the arrows
+  labs(
+    x = paste("PC1 (",round(prop_ex_var[1],2),"%)", sep = ""),
+    y = paste("PC2 (",round(prop_ex_var[2],2),"%)", sep = ""),
+    color = "Land-use",
+    shape = "Village") +
+  scale_color_manual(values = veg_colors) + 
+  theme_bw() + 
+  theme(aspect.ratio=1)+
+  theme(axis.text=element_text(size=10,color = "black"),
+        axis.title=element_text(size=12,face="bold"),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 10),
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1) 
+  ) 
+
+pdf('../results/figures/veg_plot.pdf')
+veg_plot
+dev.off()
+
+
+# vegetation data
+grid_season_veg_pca <- vegetation_pca %>%
+  dplyr::rename(veg_season_pc1 = PC1) %>%
+  dplyr::rename(veg_season_pc2 = PC2) %>%
+  dplyr::rename(grid = grid_name) %>%
+  dplyr::select(veg_season_pc1,veg_season_pc2,season,grid,village)
+
+```
+
+# Small mammals density
+
+```{r}
+# normalized small mammals abundance
+# average number of individuals per trap per village*grid*season
+
+non_native_sp <- c("Mus musculus", "Suncus etruscus", "Suncus murinus")
+
+small_mammals <- read_csv("../data/data_raw/small_mammals/Terrestrial_Mammals.csv") %>% 
+  filter(grepl("TMR", animal_id)) %>% 
+  dplyr::rename(host_species = field_identification, grid = habitat_type) 
+
+sampling_effort <- read_csv("../data/data_raw/small_mammals/Trap_Grids.csv") %>% 
+  dplyr::rename(grid = habitat_type) %>%
+  select(village, grid, season, effort_cagetraps, effort_total)
+
+# rattus
+# average captures per cagetrap
+# taking only cagetraps
+# only 2 rattus individuals captured in pitfall traps (and filtered out)
+rattus_vgs <- small_mammals %>% 
+  filter(host_species == "Rattus rattus") %>% 
+  filter(trap_type != "Pitfall") %>% 
+  count(village, grid, season) %>% 
+  dplyr::rename(n_rattus = n)
+
+# non-native sm (no rattus)
+# taking all traps including pitfalls
+sm_non_native <- small_mammals %>% 
+  filter(host_species != "Rattus rattus" & host_species %in% non_native_sp) %>% 
+  count(village, grid, season) %>% 
+  dplyr::rename(n_non_native = n)
+
+# native sm
+# taking all traps including pitfalls
+sm_native <- small_mammals %>% 
+  filter(host_species != "Rattus rattus" & !(host_species %in% non_native_sp)) %>% 
+  count(village, grid, season) %>% 
+  dplyr::rename(n_native = n)
+
+
+# combining everything to the final table
+all_sm <- sampling_effort %>% 
+  left_join(rattus_vgs) %>% 
+  left_join(sm_non_native) %>% 
+  left_join(sm_native) %>% 
+  mutate(avg_rattus = ifelse(!is.na(n_rattus), n_rattus/effort_cagetraps, 0)) %>% 
+  mutate(avg_non_native = ifelse(!is.na(n_non_native), n_non_native/effort_total, 0)) %>% 
+  mutate(avg_native = ifelse(!is.na(n_native), n_native/effort_total, 0))
+
+sm_average_abundance <- all_sm %>% 
+  select(village,grid,season,avg_rattus,avg_non_native,avg_native)
+
+
+# plotting
+
+# final matrix
+dat_mat <- small_mammals %>% 
+  select(host_species,village, grid, season) %>% 
+  count(village, grid, season, host_species) %>% 
+  spread(host_species, n, fill = 0)
+
+# name index
+grid_season_name <- dat_mat %>% 
+  select(village, grid, season) %>% 
+  unite(col="grid_name", village:season, remove = FALSE)
+
+# final matrix
+grid_dat_mat <- dat_mat %>% 
+  unite(col="grid_name", village:season, remove = TRUE) %>% 
+  column_to_rownames("grid_name") %>% 
+  as.matrix()
+
+# PCA
+# variables transformed to centered 0 and rescale to have unit variance before the analysis 
+pca_sm <- prcomp(grid_dat_mat, center = TRUE, scale. = TRUE)
+
+pca_data <- as.data.frame(pca_sm$x) %>% 
+  rownames_to_column(var = "site") %>%
+  mutate(
+    village = str_extract(site, "^[^_]+"),  # Extract everything before the first underscore (village)
+    season = str_extract(site, "[0-9]+$"),  # Extract the number at the end (season)
+    land_use = str_remove(site, paste0(village, "_")) %>%   # Remove village name and underscore
+      str_remove(paste0("_", season, "$"))  # Remove underscore + season at the end
+  ) %>%
+  select(site, PC1, PC2, land_use, village, season)
+
+pca_data$land_use <- recode(pca_data$land_use, 
+                            "brushy_regrowth" = "Savoka",
+                            "agriculture" = "Mixed agriculture",
+                            "village" = "Village",
+                            "secondary_forest" = "Secondary forest",
+                            "flooded_rice" = "Flooded rice",
+                            "agroforest" = "Agroforest",
+                            "semi-intact_forest" = "Semi-intact forest",
+                            "village" = "Village")
+
+pca_data$land_use <- factor(pca_data$land_use, levels = c("Semi-intact forest", "Secondary forest", "Savoka", "Mixed agriculture", "Agroforest","Flooded rice", "Village"))
+
+# explained variance
+ex_var <- pca_sm$sdev ^2 
+prop_ex_var <- ex_var/sum(ex_var)*100
+sum(prop_ex_var[1:2]) # first two explained variance 23.4%
+
+loadings <- data.frame(pca_sm$rotation[, 1:2], variable = rownames(pca_sm$rotation))
+
+non_native_sp <- c("Mus musculus", "Suncus etruscus", "Suncus murinus", "Rattus rattus")
+
+
+loading_top <- loadings %>% 
+  mutate(PC1_abs = abs(PC1)) %>%
+  mutate(PC2_abs = abs(PC2)) %>%
+  slice_max(n = 12, order_by = PC1_abs+PC2_abs) %>%
+  mutate(status = ifelse(variable %in% non_native_sp, "Non-native", "Native"))
+
+scaling_factor <- 7
+
+veg_colors <- c("#4d9221", "#7fbc41", "#b8e186", "#f1b6da", "#de77ae", "#c51b7d","#a00b7d")
+
+sm_plot <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(aes(color = land_use, shape = village), size = 3, alpha = 0.8) +
+  geom_segment(data = loading_top, 
+               aes(x = 0, y = 0, 
+                   xend = PC1 * scaling_factor, 
+                   yend = PC2 * scaling_factor, 
+                   color = status),  # Use status (Native/Non-Native) for arrow color
+               arrow = arrow(length = unit(0.2, "cm")),  alpha = 0.6) + 
+  labs(
+    x = paste("PC1 (", round(prop_ex_var[1], 2), "%)", sep = ""),
+    y = paste("PC2 (", round(prop_ex_var[2], 2), "%)", sep = ""),
+    color = "Land-use/Status",  # Updated legend for color
+    shape = "Village") +  
+  scale_color_manual(values = c(veg_colors,  "darkblue", "darkred")) +
+  theme_bw() + 
+  theme(aspect.ratio = 1,
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 8), 
+        legend.title = element_text(size = 10),
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)) 
+
+#pdf('../results/figures/sm_plot.pdf')
+sm_plot
+dev.off()
+```
+
+# BCI
+```{r}
+rat_data <- read_csv("../data/data_raw/small_mammals/Terrestrial_Mammals.csv") %>% 
+  filter(str_detect(animal_id,"TMR-")) %>%
+  dplyr::rename(host_species = field_identification, grid = habitat_type) %>%
+  filter(host_species == "Rattus rattus") %>% 
+  mutate(host_ID = as.numeric(gsub(".*?([0-9]+).*", "\\1", animal_id))) %>% 
+  mutate(hb = as.numeric(gsub(".*?([0-9]+).*", "\\1", hb))) %>% 
+  select(host_ID, sex, age_repro, mass, hb) %>% 
+  mutate(age_repro = ifelse(age_repro==3,2,age_repro)) %>% 
+  mutate(log_mass = log(mass), log_hb = log(hb))
+
+
+# Create a function to calculate residual BCI
+calculate_bci <- function(df) {
+  model <- lm(log_mass ~ log_hb, data = df)
+  df$BCI_residual <- resid(model)
+  return(df)
+}
+
+# Apply function separately by sex and age
+rat_bci <- rat_data %>%
+  group_by(sex, age_repro) %>%
+  group_modify(~ calculate_bci(.x)) %>%
+  ungroup() %>% 
+  select(host_ID, BCI_residual)
+
+# plotting
+#pdf('../results/figures/BCI.pdf')
+rat_data %>% 
+  drop_na() %>% 
+  mutate(age_repro = factor(age_repro, levels = c(1, 2), labels = c("Sub-adult", "Adult"))) %>% 
+  mutate(sex = factor(sex,labels = c("Female", "Male"))) %>%
+  ggplot(aes(x = log_hb, y = log_mass)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth=1) +
+  facet_grid(sex ~ age_repro) +
+  labs(
+    x = "log(length) [mm]",
+    y = "log(body mass) [g]"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+dev.off()
+```
+
+
+# Creating host metadata
+
+```{r include=FALSE}
+metadata <- read_csv("../data/data_raw/small_mammals/Terrestrial_Mammals.csv") %>% 
+  filter(str_detect(animal_id,"TMR-")) %>%
+  dplyr::rename(host_species = field_identification, grid = habitat_type) %>%
+  filter(host_species == "Rattus rattus") %>% 
+  mutate(host_ID = as.numeric(gsub(".*?([0-9]+).*", "\\1", animal_id))) %>%
+  mutate(dist_village = as.numeric(gsub(".*?([0-9]+\\.[0-9]+|[0-9]+).*", "\\1", dist_village_center))) %>%
+  mutate(dist_village = ifelse(is.na(dist_village), 0, dist_village)) %>%
+  select(host_ID,season,village,grid,mass,sex,age_repro, dist_village) %>% 
+  mutate(age_repro = ifelse(age_repro==3,2,age_repro)) # change age group 3 into 2 (classification of sub-adult/adult)
+
+# adding all the other tables: bci, vegetation, sm densities, microbiome, nematodes
+metadata_final <- metadata %>% 
+  left_join(rat_bci, by="host_ID") %>% 
+  left_join(grid_season_veg_pca, by=c("village","grid","season")) %>% 
+  left_join(sm_average_abundance, by=c("village","grid","season")) %>% 
+  left_join(microbiome_df, by="host_ID") %>% 
+  left_join(NC_infection, by="host_ID")
+
+write_csv(metadata_final, "../data/data_processed/rat_metadata.csv")
+```
+
+
+# Correlations
+
+```{r}
+# calculating correlations
+library(correlation)
+
+# reading the metadata
+metadata <- read_csv("../data/data_processed/rat_metadata.csv") 
+
+# filter only relevant hosts
+hosts <- G4_long_otu %>% 
+  distinct(host_ID)
+
+# Define feature names
+feature_names <- c(
+  "Age",
+  "Body condition",
+  "Body mass",
+  "Lachnospiraceae",
+  "Lactobacillaceae",
+  "Muribaculaceae",
+  "Native density",
+  "Nematode co-infection",
+  "Non-native density",
+  "Prevotellaceae",
+  "Rat density",
+  "Sex",
+  "Vegetation PC1",
+  "Vegetation PC2",
+  "Village distance")
+
+
+
+
+metadata_final <- metadata %>% 
+  filter(host_ID %in% hosts$host_ID) %>% 
+  dplyr::select(age_repro,
+                BCI_residual,
+                mass, 
+                Lachnospiraceae,Lactobacillaceae,Muribaculaceae,
+                avg_native,
+                nc_inf,
+                avg_non_native,
+                Prevotellaceae,
+                avg_rattus,
+                sex, 
+                veg_season_pc1, 
+                veg_season_pc2,
+                dist_village
+  ) %>% 
+  mutate(sex = ifelse(sex=="male",1,0))
+
+# Modify the dataset: rename features
+colnames(metadata_final) <- feature_names
+
+
+# correlation
+corr_results <- correlation(metadata_final, method = "auto")
+
+cat("max:", max(corr_results$r)) 
+cat("min:", min(corr_results$r))
+cat("mean:", mean(abs(corr_results$r)))
+
+
+# plotting
+#pdf('../results/figures/correlations.pdf')
+corr_results %>% 
+  #arrange(Parameter1, Parameter2) %>% 
+  ggplot(aes(x = Parameter1, y = Parameter2, fill = r)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "#f8f9fa",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_bw() +
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())+
+  labs(x="Feature 1", y="Feature 2")
+dev.off()
+```
+
