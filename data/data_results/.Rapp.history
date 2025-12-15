@@ -1,0 +1,2 @@
+load("/Users/itamartalpaz/GitHub/rat_protozoa_infection_profiles/data/data_results/sbm_fit.RData")
+sbm_fit
