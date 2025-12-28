@@ -590,6 +590,160 @@ ggarrange(
 
 
 
+# shuffling
+
+```{r}
+shuffle_matrix <- function(mat) {
+  m <- mat
+  m[] <- sample(m)   # permute all entries
+  m
+}
+# Observed SBM as baseline (already fitted earlier)
+best_obs <- which.max(sbm_fit$ICL)
+
+obs_K_host <- ncol(sbm_fit$memberships[[best_obs]]$Z1)
+obs_K_otu  <- ncol(sbm_fit$memberships[[best_obs]]$Z2)
+
+obs_host_membership <- max.col(sbm_fit$memberships[[best_obs]]$Z1)
+
+```
+
+```{r}
+library(blockmodels)
+library(tidyverse)
+
+set.seed(123)
+n_perm <- 100
+
+perm_results <- vector("list", n_perm)
+
+for (i in seq_len(n_perm)) {
+
+  cat("Permutation", i, "\n")
+
+  # Shuffle links
+  pmat_shuf <- shuffle_matrix(pmat)
+
+  # Fit SBM
+  sbm_shuf <- BM_bernoulli(pmat_shuf, membership_type = "LBM")
+  sbm_shuf$plotting <- ""
+  sbm_shuf$estimate()
+
+  best_run <- which.max(sbm_shuf$ICL)
+
+  perm_results[[i]] <- list(
+    K_host = ncol(sbm_shuf$memberships[[best_run]]$Z1),
+    K_otu  = ncol(sbm_shuf$memberships[[best_run]]$Z2),
+    host_membership = max.col(sbm_shuf$memberships[[best_run]]$Z1)
+  )
+}
+
+```
+
+```{r}
+df_K <- tibble(
+  iter = seq_len(n_perm),
+  K_host = map_int(perm_results, "K_host"),
+  K_otu  = map_int(perm_results, "K_otu")
+)
+
+# Plot: number of host groups
+ggplot(df_K, aes(K_host)) +
+  geom_histogram(binwidth = 1, fill = "grey70", color = "black") +
+  geom_vline(xintercept = obs_K_host, color = "red", linewidth = 1) +
+  theme_classic() +
+  labs(
+    title = "Null distribution of SBM host groups",
+    subtitle = "Red line = observed network",
+    x = "Number of host groups",
+    y = "Frequency"
+  )
+
+ggplot(df_K, aes(K_otu)) +
+  geom_histogram(binwidth = 1, fill = "grey70", color = "black") +
+  geom_vline(xintercept = obs_K_otu, color = "red", linewidth = 1) +
+  theme_classic() +
+  labs(
+    title = "Null distribution of SBM OTU groups",
+    subtitle = "Red line = observed network",
+    x = "Number of OTU groups",
+    y = "Frequency"
+  )
+
+# ggarrange together
+
+fig_K_perm <- ggarrange(
+  ggplot(df_K, aes(K_host)) +
+    geom_histogram(binwidth = 1, fill = "grey70", color = "black") +
+    geom_vline(xintercept = obs_K_host, color = "red", linewidth = 1) +
+    theme_classic() +
+    labs(
+      title = "Null distribution of SBM host groups",
+      subtitle = "Red line = observed network",
+      x = "Number of host groups",
+      y = "Frequency"
+    ),
+  ggplot(df_K, aes(K_otu)) +
+    geom_histogram(binwidth = 1, fill = "grey70", color = "black") +
+    geom_vline(xintercept = obs_K_otu, color = "red", linewidth = 1) +
+    theme_classic() +
+    labs(
+      title = "Null distribution of SBM OTU groups",
+      subtitle = "Red line = observed network",
+      x = "Number of OTU groups",
+      y = "Frequency"
+    ),
+  ncol = 2
+)
+```
+```{r}
+library(mclust)
+
+ari_vals <- map_dbl(
+  perm_results,
+  ~ adjustedRandIndex(obs_host_membership, .$host_membership)
+)
+df_ari <- tibble(ARI = ari_vals)
+
+ggplot(df_ari, aes(ARI)) +
+  geom_histogram(binwidth = 0.05, fill = "grey70", color = "black") +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  theme_classic() +
+  labs(
+    title = "Host membership similarity under shuffled networks",
+    subtitle = "ARI vs observed SBM",
+    x = "Adjusted Rand Index",
+    y = "Frequency"
+  )
+
+```
+
+```{r}
+host_ids <- rownames(pmat)
+
+host_stability <- sapply(seq_along(host_ids), function(h) {
+  mean(sapply(perm_results, function(r) {
+    r$host_membership[h] == obs_host_membership[h]
+  }))
+})
+
+df_host_stab <- tibble(
+  host_ID = host_ids,
+  stability = host_stability
+)
+
+ggplot(df_host_stab, aes(x = stability)) +
+  geom_histogram(binwidth = 0.05, fill = "grey70", color = "black") +
+  theme_classic() +
+  labs(
+    title = "Per-host stability under shuffled networks",
+    x = "Probability of same group as observed",
+    y = "Number of hosts"
+  )
+
+```
+
+
 # old code
 
 
